@@ -23,7 +23,7 @@ SCOPES = [
 ]
 
 EMAIL_PROMPT = """\
-You are a helpful school assistant writing a weekly digest email for parents.
+You are a helpful school assistant writing a daily update email for parents about upcoming events in the next week.
 
 You will be given a list of upcoming school events for the next week. Each event has a title, description, date/time, and parent action items.
 
@@ -100,13 +100,35 @@ def load_email_list():
 
 
 def fetch_sheet_emails(sheets_service, sheet_id):
-    """Pull email addresses from the Google Form responses sheet (column B)."""
+    """Pull email addresses and calendar opt-in from the Google Form responses sheet.
+
+    Returns (emails, cal_emails) where cal_emails are those with "Yes" in column C.
+    """
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=sheet_id,
-        range="B2:B",
+        range="B2:C",
     ).execute()
     rows = result.get("values", [])
-    return [row[0].strip() for row in rows if row and row[0].strip()]
+    emails = []
+    cal_emails = []
+    for row in rows:
+        if not row or not row[0].strip():
+            continue
+        addr = row[0].strip()
+        emails.append(addr)
+        wants_cal = len(row) > 1 and row[1].strip().lower() == "yes"
+        if wants_cal:
+            cal_emails.append(addr)
+    return emails, cal_emails
+
+
+def add_to_calendar_acl(calendar_service, calendar_id, email):
+    """Grant reader access to the calendar for the given email."""
+    rule = {
+        "role": "reader",
+        "scope": {"type": "user", "value": email},
+    }
+    calendar_service.acl().insert(calendarId=calendar_id, body=rule).execute()
 
 
 def fetch_next_week_events(service, calendar_id):
@@ -163,7 +185,7 @@ def format_events_for_prompt(events):
 
 
 def generate_email_body(openai_client, events):
-    """Use OpenAI to craft the weekly digest email from calendar events."""
+    """Use OpenAI to craft the daily digest email from calendar events."""
     events_str = format_events_for_prompt(events)
 
     response = openai_client.chat.completions.create(
@@ -220,8 +242,20 @@ def main():
     sheet_emails = []
     if signup_sheet_id:
         print("Fetching sign-up form responses...")
-        sheet_emails = fetch_sheet_emails(sheets_service, signup_sheet_id)
+        sheet_emails, cal_emails = fetch_sheet_emails(sheets_service, signup_sheet_id)
         print(f"Found {len(sheet_emails)} from Google Form.")
+
+        # Add calendar access for opt-in users not already in ACL
+        acl_lower = {e.lower() for e in acl_emails}
+        for addr in cal_emails:
+            if addr.lower() not in acl_lower:
+                try:
+                    add_to_calendar_acl(calendar_service, calendar_id, addr)
+                    acl_emails.append(addr)
+                    acl_lower.add(addr.lower())
+                    print(f"  Added to calendar: {addr}")
+                except Exception as e:
+                    print(f"  Failed to add {addr} to calendar: {e}")
 
     # Merge and deduplicate (case-insensitive)
     seen = set()
@@ -239,11 +273,11 @@ def main():
     print(f"Found {len(events)} event(s).\n")
 
     # Generate the digest email via OpenAI
-    print("Generating weekly digest email...")
+    print("Generating daily digest email...")
     email_body = generate_email_body(openai_client, events)
 
     today = datetime.now().strftime("%B %d, %Y")
-    subject = f"Weekly School Digest — {today}"
+    subject = f"School Update — {today}"
 
     print(f"\n{'=' * 60}")
     print(f"Subject: {subject}")
